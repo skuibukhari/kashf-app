@@ -140,14 +140,15 @@ app.delete('/api/users/:id', auth, needAdmin, (req, res) => {
 });
 
 /* ---------- shops / suppliers ---------- */
-function crud(base, table, fields, { shopScoped = false } = {}) {
+function crud(base, table, fields, { shopScoped = false, enrich = null } = {}) {
   app.get(base, auth, (req, res) => {
+    const withBal = (rows) => (enrich ? rows.map(enrich) : rows);
     if (req.user.role === 'shop') {
       if (!shopScoped) return res.status(403).json({ error: 'FORBIDDEN' });
       const r = db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(req.user.shop_id);
-      return res.json(r ? [r] : []);
+      return res.json(withBal(r ? [r] : []));
     }
-    res.json(db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+    res.json(withBal(db.prepare(`SELECT * FROM ${table} ORDER BY id`).all()));
   });
   app.post(base, auth, (req, res) => {
     if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
@@ -168,8 +169,19 @@ function crud(base, table, fields, { shopScoped = false } = {}) {
     res.json({ ok: true });
   });
 }
-crud('/api/shops', 'shops', ['name', 'phone', 'address', 'whatsapp', 'opening_balance', 'disabled'], { shopScoped: true });
-crud('/api/suppliers', 'suppliers', ['name', 'phone', 'address', 'opening_balance']);
+crud('/api/shops', 'shops', ['name', 'phone', 'address', 'whatsapp', 'opening_balance', 'disabled'], {
+  shopScoped: true,
+  // Current balance: +ve = shop owes us (matches ledger closing)
+  enrich: (s) => ({ ...s, balance: r2((s.opening_balance || 0)
+    + sum(`SELECT SUM(total-paid) v FROM sales WHERE customer_type='shop' AND shop_id=?`, s.id)
+    - sum(`SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in'`, s.id)) }),
+});
+crud('/api/suppliers', 'suppliers', ['name', 'phone', 'address', 'opening_balance'], {
+  // Current balance: +ve = we owe the supplier (matches ledger closing)
+  enrich: (s) => ({ ...s, balance: r2((s.opening_balance || 0)
+    + sum(`SELECT SUM(total-paid) v FROM purchases WHERE supplier_id=?`, s.id)
+    - sum(`SELECT SUM(amount) v FROM ledger_payments WHERE party_type='supplier' AND party_id=? AND direction='out'`, s.id)) }),
+});
 
 /* ---------- wallet accounts (بٹوہ) ---------- */
 const ACCT_TYPES = ['cash', 'easypaisa', 'jazzcash', 'bank', 'other'];
