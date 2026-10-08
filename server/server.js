@@ -20,6 +20,38 @@ function addDays(ymd, n) {
 }
 const sum = (sql, ...a) => Number(db.prepare(sql).get(...a)['v'] || 0);
 
+/* ---------- wallet accounts ---------- */
+// Balance = opening_balance + inflows − outflows (computed on the fly, never stored).
+// Inflows:  sales.paid (by account_id), ledger_payments direction='in' (by account_id).
+// Outflows: purchases.paid (by account_id), expenses.amount incl. personal (by account_id),
+//           ledger_payments direction='out' (by account_id).
+function getAccount(id) {
+  if (!id) return null;
+  return db.prepare('SELECT * FROM accounts WHERE id=? AND disabled=0').get(Number(id)) || null;
+}
+function accountStats(id) {
+  const a = db.prepare('SELECT * FROM accounts WHERE id=?').get(id);
+  if (!a) return null;
+  const opening = r2(a.opening_balance || 0);
+  const inflow = r2(
+    sum('SELECT SUM(paid) v FROM sales WHERE account_id=?', id) +
+    sum("SELECT SUM(amount) v FROM ledger_payments WHERE account_id=? AND direction='in'", id));
+  const outflow = r2(
+    sum('SELECT SUM(paid) v FROM purchases WHERE account_id=?', id) +
+    sum('SELECT SUM(amount) v FROM expenses WHERE account_id=?', id) +
+    sum("SELECT SUM(amount) v FROM ledger_payments WHERE account_id=? AND direction='out'", id));
+  return { id: a.id, name_ur: a.name_ur, name_en: a.name_en, type: a.type, disabled: a.disabled, opening, inflow, outflow, balance: r2(opening + inflow - outflow) };
+}
+// Voucher numbers are derived from the row id (PV-0001 …), so they stay unique
+// even if rows are deleted. Existing rows without one are backfilled at boot.
+function nextVoucherNo() {
+  const n = db.prepare('SELECT COALESCE(MAX(id),0)+1 n FROM ledger_payments').get().n;
+  return 'PV-' + String(n).padStart(4, '0');
+}
+function backfillVoucherNos() {
+  db.prepare(`UPDATE ledger_payments SET voucher_no='PV-'||substr('0000'||id,-4) WHERE voucher_no IS NULL OR voucher_no=''`).run();
+}
+
 /* ---------- auth ---------- */
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
@@ -122,8 +154,77 @@ function crud(base, table, fields, { shopScoped = false } = {}) {
     res.json({ ok: true });
   });
 }
-crud('/api/shops', 'shops', ['name', 'phone', 'address', 'whatsapp', 'disabled'], { shopScoped: true });
-crud('/api/suppliers', 'suppliers', ['name', 'phone', 'address']);
+crud('/api/shops', 'shops', ['name', 'phone', 'address', 'whatsapp', 'opening_balance', 'disabled'], { shopScoped: true });
+crud('/api/suppliers', 'suppliers', ['name', 'phone', 'address', 'opening_balance']);
+
+/* ---------- wallet accounts (بٹوہ) ---------- */
+const ACCT_TYPES = ['cash', 'easypaisa', 'jazzcash', 'bank', 'other'];
+const noShop = (req, res, next) =>
+  req.user.role === 'shop' ? res.status(403).json({ error: 'FORBIDDEN' }) : next();
+app.get('/api/accounts', auth, noShop, (req, res) => {
+  const rows = db.prepare('SELECT id FROM accounts ORDER BY id').all();
+  res.json(rows.map((r) => accountStats(r.id)));
+});
+app.post('/api/accounts', auth, needAdmin, (req, res) => {
+  const { name_ur, name_en = '', type = 'other', opening_balance = 0 } = req.body || {};
+  if (!name_ur || !ACCT_TYPES.includes(type)) return res.status(400).json({ error: 'BAD_ACCOUNT' });
+  const r = db.prepare(`INSERT INTO accounts (name_ur,name_en,type,opening_balance,created_at) VALUES (?,?,?,?,?)`)
+    .run(name_ur, name_en, type, Number(opening_balance) || 0, nowISO());
+  res.json({ id: r.lastInsertRowid });
+});
+app.put('/api/accounts/:id', auth, needAdmin, (req, res) => {
+  const a = db.prepare('SELECT * FROM accounts WHERE id=?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'NOT_FOUND' });
+  const { name_ur, name_en, type, opening_balance, disabled } = req.body || {};
+  if (type !== undefined && !ACCT_TYPES.includes(type)) return res.status(400).json({ error: 'BAD_TYPE' });
+  db.prepare(`UPDATE accounts SET name_ur=COALESCE(?,name_ur), name_en=COALESCE(?,name_en),
+    type=COALESCE(?,type), opening_balance=COALESCE(?,opening_balance),
+    disabled=COALESCE(?,disabled) WHERE id=?`)
+    .run(name_ur ?? null, name_en ?? null, type ?? null,
+      opening_balance === undefined ? null : Number(opening_balance) || 0,
+      disabled === undefined ? null : (disabled ? 1 : 0), req.params.id);
+  res.json({ ok: true });
+});
+app.get('/api/accounts/:id/statement', auth, noShop, (req, res) => {
+  const a = db.prepare('SELECT * FROM accounts WHERE id=?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'NOT_FOUND' });
+  const { from = '2000-01-01', to = '2999-12-31' } = req.query;
+  const id = a.id;
+  const evts = [];
+  for (const s of db.prepare(`SELECT date,bill_no,paid,customer_type,shop_id,
+      (SELECT name FROM shops WHERE id=s.shop_id) shop_name
+      FROM sales s WHERE account_id=? AND paid>0 ORDER BY date,id`).all(id))
+    evts.push({ date: s.date, ref: `بل ${s.bill_no}`, desc: s.customer_type === 'shop' ? (s.shop_name || '') : 'چلتا گاہک', rin: s.paid, rout: 0 });
+  for (const p of db.prepare(`SELECT date,amount,voucher_no,party_type,party_id,note FROM ledger_payments
+      WHERE account_id=? AND direction='in' ORDER BY date,id`).all(id))
+    evts.push({ date: p.date, ref: `واؤچر ${p.voucher_no || ''}`, desc: `${partyName(p.party_type, p.party_id)} — وصولی${p.note ? ' — ' + p.note : ''}`, rin: p.amount, rout: 0 });
+  for (const p of db.prepare(`SELECT date,bill_no,paid,supplier_id,
+      (SELECT name FROM suppliers WHERE id=p.supplier_id) sup_name
+      FROM purchases p WHERE account_id=? AND paid>0 ORDER BY date,id`).all(id))
+    evts.push({ date: p.date, ref: `خرید ${p.bill_no}`, desc: p.sup_name || '', rin: 0, rout: p.paid });
+  for (const e of db.prepare(`SELECT date,category,amount,note FROM expenses WHERE account_id=? ORDER BY date,id`).all(id))
+    evts.push({ date: e.date, ref: e.category, desc: e.note || '', rin: 0, rout: e.amount });
+  for (const p of db.prepare(`SELECT date,amount,voucher_no,party_type,party_id,note FROM ledger_payments
+      WHERE account_id=? AND direction='out' ORDER BY date,id`).all(id))
+    evts.push({ date: p.date, ref: `واؤچر ${p.voucher_no || ''}`, desc: `${partyName(p.party_type, p.party_id)} — ادائیگی${p.note ? ' — ' + p.note : ''}`, rin: 0, rout: p.amount });
+  evts.sort((x, y) => x.date < y.date ? -1 : x.date > y.date ? 1 : 0);
+  const opening = r2(a.opening_balance || 0);
+  // Running balance starts from opening + net of pre-period events
+  let pre = opening;
+  for (const e of evts) if (e.date < from) pre = r2(pre + (e.rin || 0) - (e.rout || 0));
+  const out = [{ date: '', ref: 'ابتدائی بیلنس', desc: '', rin: 0, rout: 0, balance: pre }];
+  let b2 = pre;
+  for (const e of evts) {
+    if (e.date < from || e.date > to) continue;
+    b2 = r2(b2 + (e.rin || 0) - (e.rout || 0));
+    out.push({ ...e, balance: b2 });
+  }
+  res.json({ account: accountStats(id), from, to, rows: out, closing: out.length ? out[out.length - 1].balance : pre });
+});
+function partyName(pt, pid) {
+  if (pt === 'shop') return db.prepare('SELECT name FROM shops WHERE id=?').get(pid)?.name || `#${pid}`;
+  return db.prepare('SELECT name FROM suppliers WHERE id=?').get(pid)?.name || `#${pid}`;
+}
 
 /* ---------- products ---------- */
 app.get('/api/products', auth, (req, res) => {
@@ -169,7 +270,7 @@ app.get('/api/purchases/:id', auth, (req, res) => {
   res.json(p);
 });
 function applyPurchase(body, createdBy) {
-  const { supplier_id, date, bill_no, items, bilty_amt = 0, bilty_paid_by = 'supplier', paid = 0, note = '' } = body;
+  const { supplier_id, date, bill_no, items, bilty_amt = 0, bilty_paid_by = 'supplier', paid = 0, note = '', account_id = null } = body;
   if (!supplier_id || !date || !Array.isArray(items) || !items.length) throw { status: 400, code: 'BAD_PURCHASE' };
   const sup = db.prepare('SELECT id FROM suppliers WHERE id=?').get(supplier_id);
   if (!sup) throw { status: 400, code: 'BAD_SUPPLIER' };
@@ -184,11 +285,18 @@ function applyPurchase(body, createdBy) {
   // Owner rule: supplier-paid bilty is NOT our cost. Only added if we paid it.
   const total = r2(subtotal + (bilty_paid_by === 'us' ? Number(bilty_amt) || 0 : 0));
   const balance = r2(total - (Number(paid) || 0));
+  const paidN = Number(paid) || 0;
+  let acctId = null;
+  if (paidN > 0) {
+    const a = getAccount(account_id);
+    if (!a) throw { status: 400, code: 'BAD_ACCOUNT' };
+    acctId = a.id;
+  } else if (account_id != null && account_id !== '') throw { status: 400, code: 'ACCOUNT_NOT_ALLOWED' };
   const id = db.prepare(`INSERT INTO purchases
-    (supplier_id,date,bill_no,subtotal,bilty_amt,bilty_paid_by,total,paid,balance,note,created_by,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    (supplier_id,date,bill_no,subtotal,bilty_amt,bilty_paid_by,total,paid,balance,account_id,note,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(supplier_id, date, bill_no || nextPurchaseBill(), subtotal, Number(bilty_amt) || 0,
-      bilty_paid_by, total, Number(paid) || 0, balance, note, createdBy, nowISO()).lastInsertRowid;
+      bilty_paid_by, total, paidN, balance, acctId, note, createdBy, nowISO()).lastInsertRowid;
   const pi = db.prepare('INSERT INTO purchase_items (purchase_id,product_id,qty,rate,amount) VALUES (?,?,?,?,?)');
   const ps = db.prepare('UPDATE products SET stock = stock + ? WHERE id=?');
   for (const it of items) { pi.run(id, it.product_id, it.qty, it.rate, r2(it.qty * it.rate)); ps.run(it.qty, it.product_id); }
@@ -236,7 +344,8 @@ app.get('/api/sales', auth, (req, res) => {
   res.json(db.prepare(sql + ' ORDER BY s.date DESC, s.id DESC').all(...a));
 });
 app.get('/api/sales/:id', auth, (req, res) => {
-  const s = db.prepare(`SELECT s.*, sh.name shop_name FROM sales s LEFT JOIN shops sh ON sh.id=s.shop_id WHERE s.id=?`).get(req.params.id);
+  const s = db.prepare(`SELECT s.*, sh.name shop_name, a.name_ur account_name FROM sales s
+    LEFT JOIN shops sh ON sh.id=s.shop_id LEFT JOIN accounts a ON a.id=s.account_id WHERE s.id=?`).get(req.params.id);
   if (!s) return res.status(404).json({ error: 'NOT_FOUND' });
   if (req.user.role === 'shop' && s.shop_id !== req.user.shop_id) return res.status(403).json({ error: 'FORBIDDEN' });
   s.items = db.prepare(`SELECT si.*, pr.name_ur, pr.unit, pr.purchase_rate FROM sale_items si JOIN products pr ON pr.id=si.product_id WHERE si.sale_id=?`).all(s.id);
@@ -245,7 +354,8 @@ app.get('/api/sales/:id', auth, (req, res) => {
 });
 function applySale(body, createdBy, billNo) {
   const { date, customer_type = 'walkin', shop_id = null, items, discount = 0,
-    paid = 0, payment_method = 'cash', note = '', manual_expenses = [] } = body;
+    paid = 0, note = '', manual_expenses = [],
+    account_id = null, expense_account_id = null } = body;
   if (!date || !Array.isArray(items) || !items.length) throw { status: 400, code: 'BAD_SALE' };
   if (customer_type === 'shop') {
     if (!shop_id) throw { status: 400, code: 'SHOP_REQUIRED' };
@@ -258,6 +368,16 @@ function applySale(body, createdBy, billNo) {
     if (!(it.qty > 0) || !(it.rate >= 0)) throw { status: 400, code: 'BAD_QTY_RATE' };
     if (pr.stock < it.qty) throw { status: 400, code: 'INSUFFICIENT_STOCK', product: pr.name_ur, available: pr.stock };
   }
+  const paidN = Number(paid) || 0;
+  // Wallet rule: money actually received must land in a real account.
+  // paid>0 => account_id required & valid; paid=0 (credit) => account_id must be NULL.
+  let acctId = null;
+  if (paidN > 0) {
+    const a = getAccount(account_id);
+    if (!a) throw { status: 400, code: 'BAD_ACCOUNT' };
+    acctId = a.id;
+  } else if (account_id != null && account_id !== '') throw { status: 400, code: 'ACCOUNT_NOT_ALLOWED' };
+  const method = paidN > 0 ? (getAccount(acctId)?.type || 'cash') : 'credit';
   const subtotal = r2(items.reduce((a, i) => a + i.qty * i.rate, 0));
   // Owner rule (2026-10-08): bilty / petrol / other delivery expenses are OUR cost.
   // They are NEVER added to the customer bill. Staff adds them manually as
@@ -267,24 +387,26 @@ function applySale(body, createdBy, billNo) {
   const balance = r2(total - (Number(paid) || 0));
   const finalBillNo = billNo || nextSaleBill();
   const id = db.prepare(`INSERT INTO sales
-    (bill_no,date,customer_type,shop_id,subtotal,bilty_amt,discount,expense_petrol,total,paid,balance,payment_method,note,created_by,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    (bill_no,date,customer_type,shop_id,subtotal,bilty_amt,discount,expense_petrol,total,paid,balance,payment_method,account_id,note,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(finalBillNo, date, customer_type, customer_type === 'shop' ? shop_id : null,
       subtotal, 0, Number(discount) || 0, 0,
-      total, Number(paid) || 0, balance, payment_method, note, createdBy, nowISO()).lastInsertRowid;
+      total, paidN, balance, method, acctId, note, createdBy, nowISO()).lastInsertRowid;
   const si = db.prepare('INSERT INTO sale_items (sale_id,product_id,qty,rate,amount) VALUES (?,?,?,?,?)');
   const ps = db.prepare('UPDATE products SET stock = stock - ? WHERE id=?');
   for (const it of items) { si.run(id, it.product_id, it.qty, it.rate, r2(it.qty * it.rate)); ps.run(it.qty, it.product_id); }
   // Manual expenses -> separate business expense entries linked to this bill
   if (Array.isArray(manual_expenses) && manual_expenses.length) {
-    const ins = db.prepare(`INSERT INTO expenses (date,category,amount,note,kind,sale_id,created_by)
-      VALUES (?,?,?,?,?,?,?)`);
+    const ea = getAccount(expense_account_id);
+    if (!ea) throw { status: 400, code: 'BAD_EXPENSE_ACCOUNT' };
+    const ins = db.prepare(`INSERT INTO expenses (date,category,amount,note,kind,sale_id,account_id,created_by)
+      VALUES (?,?,?,?,?,?,?,?)`);
     for (const e of manual_expenses) {
       const amt = Number(e.amount) || 0;
       const cat = String(e.category || '').trim();
       if (!(amt > 0) || !cat) throw { status: 400, code: 'BAD_MANUAL_EXPENSE' };
       const enote = [`بل نمبر ${finalBillNo}`, String(e.note || '').trim()].filter(Boolean).join(' — ');
-      ins.run(date, cat, r2(amt), enote, 'business', id, createdBy);
+      ins.run(date, cat, r2(amt), enote, 'business', id, ea.id, createdBy);
     }
   }
   return id;
@@ -316,29 +438,60 @@ app.delete('/api/sales/:id', auth, noDeleteForStaff, (req, res) => {
   catch (e) { db.exec('ROLLBACK'); res.status(e.status || 500).json({ error: e.code || 'FAILED' }); }
 });
 
-/* ---------- payments ---------- */
+/* ---------- payments / vouchers ---------- */
+// direction: legacy stored values are 'in' (money received INTO an account,
+// e.g. shop paid us) / 'out' (money paid OUT of an account, e.g. we paid a
+// supplier). The API accepts 'received'/'paid' from clients and maps them.
+const DIRMAP = { received: 'in', paid: 'out', in: 'in', out: 'out' };
 app.get('/api/payments', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
   const { from = '2000-01-01', to = '2999-12-31', party_type, party_id } = req.query;
-  let sql = 'SELECT * FROM ledger_payments WHERE date BETWEEN ? AND ?'; const a = [from, to];
-  if (party_type) { sql += ' AND party_type=?'; a.push(party_type); }
-  if (party_id) { sql += ' AND party_id=?'; a.push(party_id); }
-  res.json(db.prepare(sql + ' ORDER BY date DESC, id DESC').all(...a));
+  let sql = `SELECT lp.*, a.name_ur account_name,
+    COALESCE((SELECT name FROM shops WHERE id=lp.party_id AND lp.party_type='shop'),
+             (SELECT name FROM suppliers WHERE id=lp.party_id AND lp.party_type='supplier')) party_name
+    FROM ledger_payments lp LEFT JOIN accounts a ON a.id=lp.account_id
+    WHERE lp.date BETWEEN ? AND ?`; const a = [from, to];
+  if (party_type) { sql += ' AND lp.party_type=?'; a.push(party_type); }
+  if (party_id) { sql += ' AND lp.party_id=?'; a.push(party_id); }
+  res.json(db.prepare(sql + ' ORDER BY lp.date DESC, lp.id DESC').all(...a));
+});
+app.get('/api/payments/:id', auth, (req, res) => {
+  if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
+  const p = db.prepare(`SELECT lp.*, a.name_ur account_name, a.name_en account_en FROM ledger_payments lp
+    LEFT JOIN accounts a ON a.id=lp.account_id WHERE lp.id=?`).get(req.params.id);
+  if (!p) return res.status(404).json({ error: 'NOT_FOUND' });
+  p.party_name = partyName(p.party_type, p.party_id);
+  res.json(p);
 });
 app.post('/api/payments', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
-  const { date, party_type, party_id, amount, method = 'cash', direction, note = '' } = req.body || {};
-  if (!date || !['shop', 'supplier'].includes(party_type) || !party_id || !(amount > 0) || !['in', 'out'].includes(direction))
+  const { date, party_type, party_id, amount, account_id, direction, note = '' } = req.body || {};
+  const dir = DIRMAP[direction];
+  if (!date || !['shop', 'supplier'].includes(party_type) || !party_id || !(amount > 0) || !dir)
     return res.status(400).json({ error: 'BAD_PAYMENT' });
-  const r = db.prepare(`INSERT INTO ledger_payments (date,party_type,party_id,amount,method,direction,note,created_by)
-    VALUES (?,?,?,?,?,?,?,?)`).run(date, party_type, party_id, amount, method, direction, note, req.user.id);
-  res.json({ id: r.lastInsertRowid });
+  const party = party_type === 'shop'
+    ? db.prepare('SELECT id FROM shops WHERE id=?').get(party_id)
+    : db.prepare('SELECT id FROM suppliers WHERE id=?').get(party_id);
+  if (!party) return res.status(400).json({ error: 'BAD_PARTY' });
+  const a = getAccount(account_id);
+  if (!a) return res.status(400).json({ error: 'BAD_ACCOUNT' });
+  const voucher_no = nextVoucherNo();
+  const r = db.prepare(`INSERT INTO ledger_payments (date,party_type,party_id,amount,method,direction,note,account_id,voucher_no,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`).run(date, party_type, party_id, amount, a.type, dir, note, a.id, voucher_no, req.user.id);
+  res.json({ id: r.lastInsertRowid, voucher_no });
 });
 app.put('/api/payments/:id', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
-  const f = ['date', 'amount', 'method', 'direction', 'note'].filter((k) => req.body[k] !== undefined);
+  const f = ['date', 'amount', 'direction', 'note'].filter((k) => req.body[k] !== undefined);
+  const vals = f.map((k) => k === 'direction' ? DIRMAP[req.body[k]] : req.body[k]);
+  if (f.includes('direction') && !DIRMAP[req.body.direction]) return res.status(400).json({ error: 'BAD_DIRECTION' });
+  if (req.body.account_id !== undefined) {
+    const a = getAccount(req.body.account_id);
+    if (!a) return res.status(400).json({ error: 'BAD_ACCOUNT' });
+    f.push('account_id', 'method'); vals.push(a.id, a.type);
+  }
   if (f.length) db.prepare(`UPDATE ledger_payments SET ${f.map((k) => `${k}=?`).join(',')} WHERE id=?`)
-    .run(...f.map((k) => req.body[k]), req.params.id);
+    .run(...vals, req.params.id);
   res.json({ ok: true });
 });
 app.delete('/api/payments/:id', auth, noDeleteForStaff, (req, res) => {
@@ -356,18 +509,25 @@ app.get('/api/expenses', auth, (req, res) => {
 });
 app.post('/api/expenses', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
-  const { date, category, amount, note = '', kind = 'business' } = req.body || {};
+  const { date, category, amount, note = '', kind = 'business', account_id = null } = req.body || {};
   if (!date || !category || !(amount > 0) || !['business', 'personal'].includes(kind))
     return res.status(400).json({ error: 'BAD_EXPENSE' });
-  const r = db.prepare('INSERT INTO expenses (date,category,amount,note,kind,created_by) VALUES (?,?,?,?,?,?)')
-    .run(date, category, amount, note, kind, req.user.id);
+  const a = getAccount(account_id);
+  if (!a) return res.status(400).json({ error: 'BAD_ACCOUNT' });
+  const r = db.prepare('INSERT INTO expenses (date,category,amount,note,kind,account_id,created_by) VALUES (?,?,?,?,?,?,?)')
+    .run(date, category, amount, note, kind, a.id, req.user.id);
   res.json({ id: r.lastInsertRowid });
 });
 app.put('/api/expenses/:id', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
   const f = ['date', 'category', 'amount', 'note', 'kind'].filter((k) => req.body[k] !== undefined);
+  if (req.body.account_id !== undefined) {
+    const a = getAccount(req.body.account_id);
+    if (!a) return res.status(400).json({ error: 'BAD_ACCOUNT' });
+    f.push('account_id');
+  }
   if (f.length) db.prepare(`UPDATE expenses SET ${f.map((k) => `${k}=?`).join(',')} WHERE id=?`)
-    .run(...f.map((k) => req.body[k]), req.params.id);
+    .run(...f.map((k) => k === 'account_id' ? getAccount(req.body.account_id).id : req.body[k]), req.params.id);
   res.json({ ok: true });
 });
 app.delete('/api/expenses/:id', auth, noDeleteForStaff, (req, res) => {
@@ -393,16 +553,19 @@ app.get('/api/dashboard/stats', auth, (req, res) => {
   if (req.user.role === 'shop') {
     const sid = req.user.shop_id;
     const bal = r2(sum('SELECT SUM(total-paid) v FROM sales WHERE customer_type=\'shop\' AND shop_id=?', sid)
-      - sum("SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in'", sid));
+      - sum("SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in'", sid)
+      + sum('SELECT opening_balance v FROM shops WHERE id=?', sid));
     const recent = db.prepare(`SELECT id,bill_no,date,total,paid,balance FROM sales
       WHERE shop_id=? ORDER BY date DESC, id DESC LIMIT 10`).all(sid);
     return res.json({ shop: true, balance: bal, recent });
   }
   const mStart = T.slice(0, 7) + '-01';
   const receivables = r2(sum("SELECT SUM(total-paid) v FROM sales WHERE customer_type='shop'")
-    - sum("SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND direction='in'"));
+    - sum("SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND direction='in'")
+    + sum('SELECT SUM(opening_balance) v FROM shops WHERE disabled=0'));
   const payables = r2(sum('SELECT SUM(total-paid) v FROM purchases')
-    - sum("SELECT SUM(amount) v FROM ledger_payments WHERE party_type='supplier' AND direction='out'"));
+    - sum("SELECT SUM(amount) v FROM ledger_payments WHERE party_type='supplier' AND direction='out'")
+    + sum('SELECT SUM(opening_balance) v FROM suppliers'));
   const lowStock = db.prepare('SELECT id,name_ur,name_en,stock,low_threshold,unit FROM products WHERE disabled=0 AND stock<=low_threshold ORDER BY stock').all();
   const wk = [];
   for (let i = 6; i >= 0; i--) {
@@ -414,6 +577,8 @@ app.get('/api/dashboard/stats', auth, (req, res) => {
     wk.push({ date: d, revenue: rev, expenses: exp, profit: r2(rev - cogs - exp) });
   }
   const mp = pnl(mStart, T);
+  const wallets = db.prepare('SELECT id FROM accounts WHERE disabled=0 ORDER BY id').all().map((r) => accountStats(r.id));
+  const walletTotal = r2(wallets.reduce((s, w) => s + (w?.balance || 0), 0));
   res.json({
     todaySales: r2(sum('SELECT SUM(total) v FROM sales WHERE date=?', T)),
     weeklySales: r2(sum('SELECT SUM(total) v FROM sales WHERE date BETWEEN ? AND ?', addDays(T, -6), T)),
@@ -421,6 +586,7 @@ app.get('/api/dashboard/stats', auth, (req, res) => {
     receivables, payables, lowStock,
     netProfit: mp.netProfit, savings: mp.savings,
     weekly: wk,
+    wallets, walletTotal,
   });
 });
 app.get('/api/reports/pnl', auth, (req, res) => {
@@ -436,22 +602,50 @@ app.get('/api/reports/ledger', auth, (req, res) => {
     if (party_type !== 'shop' || party_id !== req.user.shop_id) return res.status(403).json({ error: 'FORBIDDEN' });
   }
   const evts = [];
+  const partyRow = party_type === 'shop'
+    ? db.prepare('SELECT opening_balance FROM shops WHERE id=?').get(party_id)
+    : db.prepare('SELECT opening_balance FROM suppliers WHERE id=?').get(party_id);
+  const partyOpening = r2(partyRow?.opening_balance || 0);
+  // Convention: shops +ve = they owe us (receivable); suppliers +ve = we owe them (payable).
   if (party_type === 'shop') {
-    for (const s of db.prepare(`SELECT date,bill_no,total FROM sales WHERE customer_type='shop' AND shop_id=? ORDER BY date,id`).all(party_id))
+    for (const s of db.prepare(`SELECT s.date,s.bill_no,s.total,s.paid,a.name_ur account_name
+        FROM sales s LEFT JOIN accounts a ON a.id=s.account_id
+        WHERE s.customer_type='shop' AND s.shop_id=? ORDER BY s.date,s.id`).all(party_id)) {
       evts.push({ date: s.date, desc: `بل ${s.bill_no}`, debit: s.total, credit: 0 });
-    for (const p of db.prepare(`SELECT date,amount,method,note FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in' ORDER BY date,id`).all(party_id))
-      evts.push({ date: p.date, desc: `وصولی (${p.method})${p.note ? ' — ' + p.note : ''}`, debit: 0, credit: p.amount });
+      // Money paid at bill time reduces what the shop owes — show it as a receipt
+      // so the ledger closing matches the dashboard receivables (total-paid).
+      if ((s.paid || 0) > 0) evts.push({ date: s.date, desc: `وصولی (بل کے وقت${s.account_name ? ' — ' + s.account_name : ''})`, debit: 0, credit: s.paid });
+    }
+    for (const p of db.prepare(`SELECT date,amount,method,note,voucher_no FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in' ORDER BY date,id`).all(party_id))
+      evts.push({ date: p.date, desc: `وصولی${p.voucher_no ? ' ' + p.voucher_no : ''} (${p.method})${p.note ? ' — ' + p.note : ''}`, debit: 0, credit: p.amount });
   } else {
-    for (const p of db.prepare('SELECT date,bill_no,total FROM purchases WHERE supplier_id=? ORDER BY date,id').all(party_id))
+    for (const p of db.prepare(`SELECT p.date,p.bill_no,p.total,p.paid,a.name_ur account_name
+        FROM purchases p LEFT JOIN accounts a ON a.id=p.account_id
+        WHERE p.supplier_id=? ORDER BY p.date,p.id`).all(party_id)) {
       evts.push({ date: p.date, desc: `خرید ${p.bill_no}`, debit: 0, credit: p.total });
-    for (const p of db.prepare(`SELECT date,amount,method,note FROM ledger_payments WHERE party_type='supplier' AND party_id=? AND direction='out' ORDER BY date,id`).all(party_id))
-      evts.push({ date: p.date, desc: `ادائیگی (${p.method})${p.note ? ' — ' + p.note : ''}`, debit: p.amount, credit: 0 });
+      // Money paid at purchase time reduces what we owe — show it as a payment
+      // so the ledger closing matches the dashboard payables (total-paid).
+      if ((p.paid || 0) > 0) evts.push({ date: p.date, desc: `ادائیگی (خرید کے وقت${p.account_name ? ' — ' + p.account_name : ''})`, debit: p.paid, credit: 0 });
+    }
+    for (const p of db.prepare(`SELECT date,amount,method,note,voucher_no FROM ledger_payments WHERE party_type='supplier' AND party_id=? AND direction='out' ORDER BY date,id`).all(party_id))
+      evts.push({ date: p.date, desc: `ادائیگی${p.voucher_no ? ' ' + p.voucher_no : ''} (${p.method})${p.note ? ' — ' + p.note : ''}`, debit: p.amount, credit: 0 });
   }
-  let bal = 0, opening = 0; const rows = [];
+  // Period-start balance = party opening + net of pre-period events
+  // (sales and payment events are each date-ordered but need a combined sort
+  // for a correct running balance; stable sort keeps bill before its payment)
+  evts.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  let opening = partyOpening;
   for (const e of evts) {
+    if (e.date >= from || e.date === '') continue;
+    opening = r2(party_type === 'shop' ? opening + e.debit - e.credit : opening + e.credit - e.debit);
+  }
+  const rows = [{ date: '', desc: 'ابتدائی بقایا / Opening',
+    debit: party_type === 'shop' ? opening : 0, credit: party_type === 'supplier' ? opening : 0, balance: opening }];
+  let bal = opening;
+  for (const e of evts) {
+    if (e.date < from) continue;
     bal = r2(party_type === 'shop' ? bal + e.debit - e.credit : bal + e.credit - e.debit);
-    if (e.date < from) opening = bal;
-    else if (e.date <= to) rows.push({ ...e, balance: bal });
+    if (e.date <= to) rows.push({ ...e, balance: bal });
   }
   res.json({ party_type, party_id, from, to, opening, rows, closing: rows.length ? rows[rows.length - 1].balance : opening });
 });
@@ -462,7 +656,7 @@ app.get('/api/reports/cashsales', auth, (req, res) => {
     (SELECT GROUP_CONCAT(p.name_ur||' '||si.qty||'x'||si.rate, '، ') FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=s.id) items,
     (SELECT SUM(si.qty*(si.rate-p.purchase_rate)) FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=s.id) margin
     FROM sales s LEFT JOIN shops sh ON sh.id=s.shop_id
-    WHERE s.payment_method IN ('cash','easypaisa') AND s.date BETWEEN ? AND ?
+    WHERE s.paid > 0 AND s.date BETWEEN ? AND ?
     ORDER BY s.date DESC, s.id DESC`).all(from, to);
   const qq = q.trim();
   res.json(qq ? rows.filter((r) => (r.bill_no + r.items + r.shop_name).includes(qq)) : rows);
@@ -502,6 +696,29 @@ app.post('/api/backup/drive', auth, needAdmin, (req, res) => {
     message: 'Google Drive upload is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN env vars and implement the upload in server.js (see code comments).' });
 });
 
+/* ---------- admin: wipe all transactional data ---------- */
+// Scope: deletes ALL transactions (sales, sale_items, purchases, purchase_items,
+// ledger_payments, expenses), resets product stock to 0 and party opening
+// balances to 0. Keeps masters: users, products, shops, suppliers, accounts.
+// A full JSON backup is written first; the client must send {confirm:'DELETE'}.
+app.post('/api/admin/wipe', auth, needAdmin, (req, res) => {
+  if (!req.body || req.body.confirm !== 'DELETE') return res.status(400).json({ error: 'CONFIRM_REQUIRED' });
+  const stamp = `kashf-backup-prewipe-${todayLocal()}-${Date.now()}.json`;
+  try {
+    fs.writeFileSync(path.join(BACKUP_DIR, stamp), JSON.stringify(exportAll(), null, 1));
+  } catch (e) { return res.status(500).json({ error: 'BACKUP_FAILED' }); }
+  db.exec('BEGIN');
+  try {
+    for (const t of ['sale_items', 'sales', 'purchase_items', 'purchases', 'ledger_payments', 'expenses'])
+      db.prepare(`DELETE FROM ${t}`).run();
+    db.prepare('UPDATE products SET stock=0').run();
+    db.prepare('UPDATE shops SET opening_balance=0').run();
+    db.prepare('UPDATE suppliers SET opening_balance=0').run();
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); return res.status(500).json({ error: 'WIPE_FAILED' }); }
+  res.json({ ok: true, backup: stamp });
+});
+
 /* ---------- static frontend ---------- */
 const DIST = path.join(__dirname, '..', 'client', 'dist');
 if (fs.existsSync(DIST)) {
@@ -517,6 +734,7 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'NOT_FOUND' }));
 
 /* ---------- boot ---------- */
 seedIfNeeded();
+backfillVoucherNos();
 const bkp = autoBackup();
 // BASE_PATH lets the app live under a sub-path like /kashf on Alwaysdata
 // (e.g. site address kashf.alwaysdata.net/kashf). The whole app — API and

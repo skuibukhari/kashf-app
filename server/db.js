@@ -71,14 +71,73 @@ CREATE TABLE IF NOT EXISTS expenses (
   category TEXT NOT NULL, amount REAL NOT NULL, note TEXT DEFAULT '',
   kind TEXT NOT NULL DEFAULT 'business', created_by INTEGER
 );
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name_ur TEXT NOT NULL, name_en TEXT DEFAULT '',
+  type TEXT NOT NULL DEFAULT 'other',
+  opening_balance REAL NOT NULL DEFAULT 0,
+  disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+);
 `;
 db.exec(SCHEMA);
 // Lightweight migrations for existing databases
 for (const sql of [
   'ALTER TABLE expenses ADD COLUMN sale_id INTEGER',
+  'ALTER TABLE sales ADD COLUMN account_id INTEGER',
+  'ALTER TABLE purchases ADD COLUMN account_id INTEGER',
+  'ALTER TABLE expenses ADD COLUMN account_id INTEGER',
+  'ALTER TABLE ledger_payments ADD COLUMN account_id INTEGER',
+  'ALTER TABLE ledger_payments ADD COLUMN voucher_no TEXT',
+  'ALTER TABLE shops ADD COLUMN opening_balance REAL DEFAULT 0',
+  'ALTER TABLE suppliers ADD COLUMN opening_balance REAL DEFAULT 0',
 ]) {
   try { db.exec(sql); } catch (e) { /* column already exists */ }
 }
+
+/* ---------- wallet accounts ---------- */
+// Sign conventions (kept consistent across server.js):
+// - shops: balance +ve = THEY OWE US (receivable). Credit sale increases it;
+//   payment received ('in') decreases it. shops.opening_balance +5000 => they owe us 5000.
+// - suppliers: balance +ve = WE OWE THEM (payable). Credit purchase increases it;
+//   payment made ('out') decreases it. suppliers.opening_balance +5000 => we owe them 5000.
+// - accounts (wallets): balance = opening_balance + inflows - outflows (computed, never stored).
+//   Inflows:  sales.paid (by account_id), ledger_payments direction='in' (by account_id).
+//   Outflows: purchases.paid (by account_id), expenses.amount incl. personal (by account_id),
+//             ledger_payments direction='out' (by account_id).
+// - ledger_payments.direction uses the legacy values 'in' (money received into an
+//   account) / 'out' (money paid out of an account). The voucher API accepts
+//   'received'/'paid' from the client and maps them to 'in'/'out'.
+function seedAccountsIfNeeded() {
+  const n = db.prepare('SELECT COUNT(*) c FROM accounts').get().c;
+  if (n > 0) return false;
+  const iso = nowISO();
+  const ins = db.prepare(`INSERT INTO accounts (name_ur,name_en,type,opening_balance,created_at) VALUES (?,?,?,?,?)`);
+  ins.run('نقد رقم', 'Cash', 'cash', 0, iso);
+  ins.run('EasyPaisa', 'EasyPaisa', 'easypaisa', 0, iso);
+  ins.run('JazzCash', 'JazzCash', 'jazzcash', 0, iso);
+  ins.run('بینک', 'Bank', 'bank', 0, iso);
+  return true;
+}
+// One-time mapping of legacy payment_method/method strings to accounts (only rows
+// whose account_id is still NULL, so it never overwrites user choices).
+function mapLegacyAccounts() {
+  const idOf = (type) => db.prepare('SELECT id FROM accounts WHERE type=? AND disabled=0').get(type)?.id || null;
+  const cash = idOf('cash'), ep = idOf('easypaisa'), bank = idOf('bank');
+  if (cash) {
+    db.prepare(`UPDATE sales SET account_id=? WHERE account_id IS NULL AND payment_method='cash' AND paid>0`).run(cash);
+    db.prepare(`UPDATE ledger_payments SET account_id=? WHERE account_id IS NULL AND method='cash'`).run(cash);
+  }
+  if (ep) {
+    db.prepare(`UPDATE sales SET account_id=? WHERE account_id IS NULL AND payment_method IN ('wallet','easypaisa') AND paid>0`).run(ep);
+    db.prepare(`UPDATE ledger_payments SET account_id=? WHERE account_id IS NULL AND method IN ('wallet','easypaisa')`).run(ep);
+  }
+  if (bank) {
+    db.prepare(`UPDATE sales SET account_id=? WHERE account_id IS NULL AND payment_method='bank' AND paid>0`).run(bank);
+    db.prepare(`UPDATE ledger_payments SET account_id=? WHERE account_id IS NULL AND method='bank'`).run(bank);
+  }
+}
+seedAccountsIfNeeded();
+mapLegacyAccounts();
 
 function todayLocal(d = new Date()) {
   const p = (n) => String(n).padStart(2, '0');
@@ -88,7 +147,7 @@ function nowISO() { return new Date().toISOString(); }
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
 const TABLES = ['users', 'shops', 'suppliers', 'products', 'purchases', 'purchase_items',
-  'sales', 'sale_items', 'ledger_payments', 'expenses'];
+  'sales', 'sale_items', 'ledger_payments', 'expenses', 'accounts'];
 
 function exportAll() {
   const out = { app: 'kashf', exported_at: nowISO(), tables: {} };

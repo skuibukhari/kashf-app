@@ -15,8 +15,14 @@ First boot seeds demo data + logins: `admin/admin123`, `staff/staff123`,
 ## Business rules (as specified by the owner)
 - **Purchase:** supplier pays the bilty (freight). `bilty_amt` is recorded but NOT added
   to our purchase cost (unless `bilty_paid_by='us'`).
-- **Sale:** WE pay bilty + petrol. Both are added to the bill total (charged to the
-  customer) and counted as our cost in margin math, so bill profit = subtotal − discount − COGS.
+- **Sale:** bilty/petrol/other delivery costs are NEVER added to the customer bill.
+  They are entered manually as separate business expense entries linked to the bill
+  (`expenses.sale_id`), each visible as its own ledger line.
+- **Wallets (بٹوہ):** money lives in accounts (Cash, EasyPaisa, JazzCash, Bank…),
+  each with an opening balance. Every receipt/payment links to an account;
+  balance = opening + in − out (computed, never stored).
+- **Parties:** shops/suppliers can carry an opening balance (receivable/payable).
+  Payments go through numbered vouchers (`PV-0001…`) linked to an account.
 - **Personal expenses** (donation etc., `kind='personal'`) are NEVER part of business P&L.
   Dashboard shows **Net Profit/Loss** and **Savings** as separate cards
   (Savings = Net Profit − Personal expenses).
