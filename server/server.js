@@ -282,7 +282,9 @@ function nextPurchaseBill() { return 'PUR-' + String(db.prepare('SELECT COALESCE
 app.get('/api/purchases', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
   const { from = '2000-01-01', to = '2999-12-31', supplier_id } = req.query;
-  let sql = `SELECT p.*, s.name supplier_name FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id
+  let sql = `SELECT p.*, s.name supplier_name,
+             COALESCE((SELECT SUM(qty) FROM purchase_items pi WHERE pi.purchase_id=p.id), 0) total_qty
+             FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id
              WHERE p.date BETWEEN ? AND ?`;
   const a = [from, to];
   if (supplier_id) { sql += ' AND p.supplier_id=?'; a.push(supplier_id); }
