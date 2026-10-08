@@ -59,7 +59,7 @@ function auth(req, res, next) {
   if (!tok) return res.status(401).json({ error: 'NO_TOKEN' });
   try {
     const p = jwt.verify(tok, JWT_SECRET);
-    const u = db.prepare('SELECT id,name,username,role,shop_id,disabled FROM users WHERE id=?').get(p.id);
+    const u = db.prepare('SELECT id,name,username,role,shop_id,disabled,is_super FROM users WHERE id=?').get(p.id);
     if (!u || u.disabled) return res.status(403).json({ error: 'ACCOUNT_DISABLED' });
     req.user = u; next();
   } catch { return res.status(401).json({ error: 'BAD_TOKEN' }); }
@@ -75,18 +75,20 @@ app.post('/api/auth/login', (req, res) => {
   if (!u || u.disabled || !bcrypt.compareSync(password || '', u.pass_hash))
     return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
   const token = jwt.sign({ id: u.id, role: u.role, shop_id: u.shop_id }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: u.id, name: u.name, username: u.username, role: u.role, shop_id: u.shop_id } });
+  res.json({ token, user: { id: u.id, name: u.name, username: u.username, role: u.role, shop_id: u.shop_id, is_super: u.is_super || 0 } });
 });
 app.get('/api/auth/me', auth, (req, res) => res.json(req.user));
 
 /* ---------- users (admin) ---------- */
 app.get('/api/users', auth, needAdmin, (req, res) => {
-  res.json(db.prepare('SELECT id,name,username,role,shop_id,disabled,created_at FROM users ORDER BY id').all());
+  res.json(db.prepare('SELECT id,name,username,role,shop_id,disabled,is_super,created_at FROM users ORDER BY id').all());
 });
 app.post('/api/users', auth, needAdmin, (req, res) => {
   const { name, username, password, role, shop_id } = req.body || {};
   if (!name || !username || !password) return res.status(400).json({ error: 'MISSING_FIELDS' });
   if (!['admin', 'staff', 'shop'].includes(role)) return res.status(400).json({ error: 'BAD_ROLE' });
+  // Only the main (super) admin can create admin users
+  if (role === 'admin' && !req.user.is_super) return res.status(403).json({ error: 'SUPER_ONLY' });
   if (role === 'shop' && !shop_id) return res.status(400).json({ error: 'SHOP_REQUIRED' });
   try {
     const r = db.prepare('INSERT INTO users (name,username,pass_hash,role,shop_id,created_at) VALUES (?,?,?,?,?,?)')
@@ -99,6 +101,14 @@ app.put('/api/users/:id', auth, needAdmin, (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
   if (!u) return res.status(404).json({ error: 'NOT_FOUND' });
   const { name, password, role, shop_id, disabled } = req.body || {};
+  // Main (super) admin is protected: nobody else may touch this account
+  if (u.is_super && id !== req.user.id) return res.status(403).json({ error: 'SUPER_PROTECTED' });
+  // Fellow admins are managed by the super admin only (edit/password/disable)
+  if (u.role === 'admin' && id !== req.user.id && !req.user.is_super)
+    return res.status(403).json({ error: 'ADMINS_BY_SUPER_ONLY' });
+  // Granting/removing the admin role is a super-admin power
+  if (role && role !== u.role && (role === 'admin' || u.role === 'admin') && !req.user.is_super)
+    return res.status(403).json({ error: 'SUPER_ONLY' });
   if (id === req.user.id && (disabled === 1 || disabled === true))
     return res.status(400).json({ error: 'CANNOT_DISABLE_SELF' });
   if (u.role === 'admin' && role && role !== 'admin') {
@@ -117,6 +127,10 @@ app.delete('/api/users/:id', auth, needAdmin, (req, res) => {
   if (id === req.user.id) return res.status(400).json({ error: 'CANNOT_DELETE_SELF' });
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
   if (!u) return res.status(404).json({ error: 'NOT_FOUND' });
+  // The main (super) admin can never be deleted
+  if (u.is_super) return res.status(403).json({ error: 'SUPER_PROTECTED' });
+  // Only the super admin can delete fellow admins
+  if (u.role === 'admin' && !req.user.is_super) return res.status(403).json({ error: 'ADMINS_BY_SUPER_ONLY' });
   if (u.role === 'admin') {
     const c = db.prepare("SELECT COUNT(*) v FROM users WHERE role='admin' AND id<>?").get(id).v;
     if (!c) return res.status(400).json({ error: 'LAST_ADMIN' });

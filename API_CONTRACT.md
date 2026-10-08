@@ -9,10 +9,11 @@ Error shape: `{ error: 'CODE', product?, available? }`.
 - `GET /api/auth/me` → `{id,name,username,role,shop_id}` (role: admin|staff|shop)
 
 ## Users (admin only)
-- `GET /api/users` → `[{id,name,username,role,shop_id,disabled,created_at}]`
-- `POST /api/users` `{name*,username*,password*,role*,shop_id?}` → `{id}`
-- `PUT /api/users/:id` `{name?,password?,role?,shop_id?,disabled?}` → `{ok:true}`
-- `DELETE /api/users/:id` → `{ok:true}`
+- `GET /api/users` → `[{id,name,username,role,shop_id,disabled,is_super,created_at}]`
+- `POST /api/users` `{name*,username*,password*,role*,shop_id?}` → `{id}` (role=admin requires super admin → 403 SUPER_ONLY)
+- `PUT /api/users/:id` `{name?,password?,role?,shop_id?,disabled?}` → `{ok:true}` (super admin account untouchable by others → 403 SUPER_PROTECTED; fellow admins managed by super only → 403 ADMINS_BY_SUPER_ONLY)
+- `DELETE /api/users/:id` → `{ok:true}` (super admin can never be deleted)
+- Main (super) admin: the seeded `admin` user (is_super=1, shown with 🔒). Only the super admin can create admin users, change admin passwords, or disable/delete admins. Other admins can fully manage staff/shop users and shops.
 
 ## Shops / Suppliers
 - `GET /api/shops` (shop role → only own shop) / `POST {name*,phone,address,whatsapp}` / `PUT /:id` / `DELETE /:id` (admin)

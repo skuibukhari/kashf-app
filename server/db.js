@@ -90,9 +90,19 @@ for (const sql of [
   'ALTER TABLE ledger_payments ADD COLUMN voucher_no TEXT',
   'ALTER TABLE shops ADD COLUMN opening_balance REAL DEFAULT 0',
   'ALTER TABLE suppliers ADD COLUMN opening_balance REAL DEFAULT 0',
+  'ALTER TABLE users ADD COLUMN is_super INTEGER NOT NULL DEFAULT 0',
 ]) {
   try { db.exec(sql); } catch (e) { /* column already exists */ }
 }
+// Main (super) admin protection: exactly one protected super admin must exist.
+// Fresh DBs get it from seedIfNeeded; existing DBs promote the oldest admin once.
+try {
+  const n = db.prepare('SELECT COUNT(*) c FROM users WHERE is_super=1').get().c;
+  if (!n) {
+    const adm = db.prepare("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").get();
+    if (adm) db.prepare('UPDATE users SET is_super=1 WHERE id=?').run(adm.id);
+  }
+} catch (e) { /* users table not seeded yet */ }
 
 /* ---------- wallet accounts ---------- */
 // Sign conventions (kept consistent across server.js):
@@ -191,14 +201,14 @@ function seedIfNeeded() {
   const H = (pw) => bcrypt.hashSync(pw, 10);
   db.exec('BEGIN');
   try {
-    const u = db.prepare('INSERT INTO users (name,username,pass_hash,role,shop_id,created_at) VALUES (?,?,?,?,?,?)');
-    u.run('ایڈمن', 'admin', H('admin123'), 'admin', null, iso);
-    u.run('اسٹاف', 'staff', H('staff123'), 'staff', null, iso);
+    const u = db.prepare('INSERT INTO users (name,username,pass_hash,role,shop_id,is_super,created_at) VALUES (?,?,?,?,?,?,?)');
+    u.run('ایڈمن', 'admin', H('admin123'), 'admin', null, 1, iso);
+    u.run('اسٹاف', 'staff', H('staff123'), 'staff', null, 0, iso);
     const sh = db.prepare('INSERT INTO shops (name,phone,address,whatsapp) VALUES (?,?,?,?)');
     const s1 = sh.run('المدینہ کریانہ اسٹور', '', 'مین بازار', '').lastInsertRowid;
     const s2 = sh.run('نیو مدینہ سویٹس', '', 'چاندنی چوک', '').lastInsertRowid;
-    u.run('المدینہ کریانہ', 'shop1', H('shop123'), 'shop', s1, iso);
-    u.run('نیو مدینہ سویٹس', 'shop2', H('shop123'), 'shop', s2, iso);
+    u.run('المدینہ کریانہ', 'shop1', H('shop123'), 'shop', s1, 0, iso);
+    u.run('نیو مدینہ سویٹس', 'shop2', H('shop123'), 'shop', s2, 0, iso);
     const sup = db.prepare("INSERT INTO suppliers (name,phone,address) VALUES ('المدینہ ڈیری فارم','','')").run().lastInsertRowid;
     const p = db.prepare(`INSERT INTO products
       (name_ur,name_en,category,unit,purchase_rate,sale_rate,wholesale_rate,stock,low_threshold)
