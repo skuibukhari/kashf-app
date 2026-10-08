@@ -1,3 +1,4 @@
 node_modules/
 server/data/*.db*
 server/backups/*.json
+client/node_modules/

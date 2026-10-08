@@ -518,4 +518,12 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'NOT_FOUND' }));
 /* ---------- boot ---------- */
 seedIfNeeded();
 const bkp = autoBackup();
-app.listen(PORT, () => console.log(`Kashf server on :${PORT}${bkp ? ' (backup: ' + bkp + ')' : ''}`));
+// BASE_PATH lets the app live under a sub-path like /kashf on Alwaysdata
+// (e.g. site address kashf.alwaysdata.net/kashf). The whole app — API and
+// frontend — is mounted under it; the frontend build uses relative asset
+// paths (vite base './') and prefixes /api calls with VITE_BASE_PATH.
+const BASE_PATH = (process.env.BASE_PATH || '').replace(/\/+$/, '');
+const handler = BASE_PATH
+  ? (() => { const m = express(); m.use(BASE_PATH, app); return m; })()
+  : app;
+handler.listen(PORT, () => console.log(`Kashf server on :${PORT}${BASE_PATH ? ' base ' + BASE_PATH : ''}${bkp ? ' (backup: ' + bkp + ')' : ''}`));

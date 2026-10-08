@@ -26,10 +26,17 @@ kashf-app/
    npm install --production
    ```
 3. Alwaysdata panel → **Web → Sites → Add a Node.js site**
+   - Site address: `kashf.alwaysdata.net/kashf` (a **path** on your own domain —
+     a separate `kashf-app.alwaysdata.net` address is rejected by the panel:
+     "the domain name alwaysdata.net does not belong to you")
    - Working directory / application root: the `server/` folder (e.g. `~/kashf-app/server`)
    - Start file / command: `node server.js`
-   - Environment: `PORT=8100` (Alwaysdata gives you a port — use the one shown in the panel)
-   - Optional: `JWT_SECRET=<a long random string>` (if unset, a dev default is used — set one!)
+   - Environment:
+     - `PORT=8100` (Alwaysdata gives you a port — use the one shown in the panel)
+     - `JWT_SECRET=<a long random string>` (if unset, a dev default is used — set one!)
+     - `BASE_PATH=/kashf` (REQUIRED when the site address has a path — the app
+       mounts its API + frontend under it; the frontend build already uses
+       relative asset paths and prefixes `/api` calls with `VITE_BASE_PATH`)
 4. Start the site from the panel. First boot **seeds** the database:
    - `admin` / `admin123` (full access)
    - `staff` / `staff123`
@@ -42,3 +49,5 @@ kashf-app/
 - A dated JSON auto-backup is written to `server/backups/` on every fresh boot (max 30 kept). One-click backup/restore is also in the app (Backup tab).
 - Google Drive auto-upload is a stub (`POST /api/backup/drive` → 501). To enable: create a Google Cloud project + OAuth client, set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` env vars, and implement the upload in `server/server.js` (see the code comments there).
 - To rebuild the frontend after changes: `cd client && npm install && npm run build` (needs Node 18+ locally), then re-upload `client/dist/`.
+  If the site address has a path (e.g. `/kashf`), build with the matching base:
+  `VITE_BASE_PATH=/kashf npm run build` (at domain root, omit it).
