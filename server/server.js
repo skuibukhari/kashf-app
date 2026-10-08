@@ -736,6 +736,12 @@ app.post('/api/admin/wipe', auth, needAdmin, (req, res) => {
 /* ---------- static frontend ---------- */
 const DIST = path.join(__dirname, '..', 'client', 'dist');
 if (fs.existsSync(DIST)) {
+  // Never HTTP-cache the service worker / manifest: the browser must re-check
+  // for a new SW on every visit, otherwise PWA updates never reach phones.
+  app.get(['/sw.js', '/manifest.json'], (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
   app.use(express.static(DIST));
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api')) return res.status(404).json({ error: 'NOT_FOUND' });
