@@ -676,6 +676,16 @@ app.get('/api/reports/cashsales', auth, (req, res) => {
   res.json(qq ? rows.filter((r) => (r.bill_no + r.items + r.shop_name).includes(qq)) : rows);
 });
 
+/* ---------- stock report: purchased vs sold vs available ---------- */
+app.get('/api/reports/stock', auth, noShop, (req, res) => {
+  const rows = db.prepare(`
+    SELECT p.id, p.name_ur, p.name_en, p.unit, p.stock, p.low_threshold,
+      COALESCE((SELECT SUM(qty) FROM purchase_items pi WHERE pi.product_id = p.id), 0) AS purchased,
+      COALESCE((SELECT SUM(qty) FROM sale_items si WHERE si.product_id = p.id), 0) AS sold
+    FROM products p WHERE p.disabled = 0 ORDER BY p.name_ur`).all();
+  res.json(rows);
+});
+
 /* ---------- backup ---------- */
 app.get('/api/backup/export', auth, (req, res) => {
   if (req.user.role === 'shop') return res.status(403).json({ error: 'FORBIDDEN' });
