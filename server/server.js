@@ -340,12 +340,15 @@ function revertPurchase(id) {
   const p = db.prepare('SELECT * FROM purchases WHERE id=?').get(id);
   if (!p) throw { status: 404, code: 'NOT_FOUND' };
   const items = db.prepare('SELECT * FROM purchase_items WHERE purchase_id=?').all(id);
-  for (const it of items) {
-    const pr = db.prepare('SELECT stock,name_ur FROM products WHERE id=?').get(it.product_id);
-    if (pr.stock < it.qty) throw { status: 400, code: 'STOCK_WOULD_GO_NEGATIVE', product: pr.name_ur };
-  }
   const ps = db.prepare('UPDATE products SET stock = stock - ? WHERE id=?');
-  for (const it of items) ps.run(it.qty, it.product_id);
+  for (const it of items) {
+    const pr = db.prepare('SELECT stock FROM products WHERE id=?').get(it.product_id);
+    // Clamp at 0 instead of blocking: service/charge items (e.g. bilty) have no
+    // physical stock, so deducting would go negative. Real goods still deduct
+    // correctly when stock is available.
+    const deduct = Math.min(it.qty, Math.max(0, pr ? pr.stock : 0));
+    if (deduct > 0) ps.run(deduct, it.product_id);
+  }
   db.prepare('DELETE FROM purchase_items WHERE purchase_id=?').run(id);
   db.prepare('DELETE FROM purchases WHERE id=?').run(id);
 }
