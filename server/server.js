@@ -502,6 +502,25 @@ app.get('/api/payments/:id', auth, (req, res) => {
     LEFT JOIN accounts a ON a.id=lp.account_id WHERE lp.id=?`).get(req.params.id);
   if (!p) return res.status(404).json({ error: 'NOT_FOUND' });
   p.party_name = partyName(p.party_type, p.party_id);
+  // Balances around this voucher (sabqa baqaya): current party balance plus back
+  // this voucher's amount (the voucher reduced the outstanding). remaining =
+  // current balance (exact when this is the latest transaction).
+  const amt = r2(p.amount || 0);
+  if (p.party_type === 'shop') {
+    const sh = db.prepare('SELECT opening_balance FROM shops WHERE id=?').get(p.party_id);
+    const balNow = r2((sh && sh.opening_balance || 0)
+      + sum(`SELECT SUM(total-paid) v FROM sales WHERE customer_type='shop' AND shop_id=?`, p.party_id)
+      - sum(`SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in'`, p.party_id));
+    p.prev_balance = r2(balNow + (p.direction === 'in' ? amt : p.direction === 'out' ? -amt : 0));
+    p.remaining_balance = balNow;
+  } else if (p.party_type === 'supplier') {
+    const sp = db.prepare('SELECT opening_balance FROM suppliers WHERE id=?').get(p.party_id);
+    const balNow = r2((sp && sp.opening_balance || 0)
+      + sum(`SELECT SUM(total-paid) v FROM purchases WHERE supplier_id=?`, p.party_id)
+      - sum(`SELECT SUM(amount) v FROM ledger_payments WHERE party_type='supplier' AND party_id=? AND direction='out'`, p.party_id));
+    p.prev_balance = r2(balNow + (p.direction === 'out' ? amt : p.direction === 'in' ? -amt : 0));
+    p.remaining_balance = balNow;
+  }
   res.json(p);
 });
 app.post('/api/payments', auth, (req, res) => {
