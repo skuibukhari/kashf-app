@@ -381,6 +381,16 @@ app.get('/api/sales/:id', auth, (req, res) => {
   if (req.user.role === 'shop' && s.shop_id !== req.user.shop_id) return res.status(403).json({ error: 'FORBIDDEN' });
   s.items = db.prepare(`SELECT si.*, pr.name_ur, pr.unit, pr.purchase_rate FROM sale_items si JOIN products pr ON pr.id=si.product_id WHERE si.sale_id=?`).all(s.id);
   s.expenses = db.prepare(`SELECT id, date, category, amount, note FROM expenses WHERE sale_id=? ORDER BY id`).all(s.id);
+  // Previous shop balance just before this bill (sabqa baqaya): current shop balance
+  // minus this bill's own net (total-paid). Exact when this is the shop's latest
+  // transaction — the normal print/share flow right after creating the bill.
+  if (s.customer_type === 'shop' && s.shop_id) {
+    const sh = db.prepare('SELECT opening_balance FROM shops WHERE id=?').get(s.shop_id);
+    const balNow = r2((sh && sh.opening_balance || 0)
+      + sum(`SELECT SUM(total-paid) v FROM sales WHERE customer_type='shop' AND shop_id=?`, s.shop_id)
+      - sum(`SELECT SUM(amount) v FROM ledger_payments WHERE party_type='shop' AND party_id=? AND direction='in'`, s.shop_id));
+    s.prev_balance = r2(balNow - (r2(s.total || 0) - r2(s.paid || 0)));
+  }
   res.json(s);
 });
 function applySale(body, createdBy, billNo) {
